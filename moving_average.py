@@ -96,33 +96,157 @@ def weighted_moving_average_smooth(data, window_size, weights=None, center=False
     return smoothed
 
 
-def exponential_moving_average_smooth(data, span=None, alpha=None):
+def exponential_moving_average_smooth(
+    data,
+    span=None,
+    alpha=None,
+    com=None,
+    halflife=None,
+    adjust=False,
+    bias_correction=False,
+    min_periods=1
+):
     """
-    指数移动平均平滑服务（EMA）
+    指数加权移动平均平滑服务（EWMA / EMA）
+
+    提供四种参数化方式（四选一）：
+    - alpha: 直接指定平滑因子，0 < alpha <= 1
+    - span: 衰减跨度，alpha = 2 / (span + 1)
+    - com: 质心，alpha = 1 / (com + 1)
+    - halflife: 半衰期，alpha = 1 - exp(-ln(2) / halflife)
 
     Parameters
     ----------
     data : array-like
         输入的时间序列数据
     span : float, optional
-        指数衰减跨度，与 alpha 二选一
+        指数衰减跨度，如 span=5 则 alpha≈0.333
     alpha : float, optional
-        平滑因子，0 < alpha <= 1，与 span 二选一
+        平滑因子，0 < alpha <= 1
+    com : float, optional
+        质心参数，com >= 0
+    halflife : float, optional
+        半衰期，halflife > 0
+    adjust : bool, optional
+        是否使用调整后的权重（True：使用递归公式的精确形式；False：使用近似形式），默认为 False
+    bias_correction : bool, optional
+        是否进行偏差校正（仅在 adjust=False 时有效），默认为 False。
+        对初期小样本进行偏差校正，使估计更准确。
+    min_periods : int, optional
+        最少观测值数量，默认为 1
 
     Returns
     -------
     pd.Series
         平滑后的时间序列
     """
-    if span is None and alpha is None:
-        raise ValueError("必须指定 span 或 alpha 其中之一")
-    if span is not None and alpha is not None:
-        raise ValueError("span 和 alpha 只能指定一个")
+    param_count = sum(x is not None for x in [span, alpha, com, halflife])
+    if param_count == 0:
+        raise ValueError("必须指定 span、alpha、com、halflife 其中之一")
+    if param_count > 1:
+        raise ValueError("span、alpha、com、halflife 只能指定一个")
+
+    if alpha is not None and not (0 < alpha <= 1):
+        raise ValueError("alpha 必须满足 0 < alpha <= 1")
+    if span is not None and span <= 0:
+        raise ValueError("span 必须为正数")
+    if com is not None and com < 0:
+        raise ValueError("com 必须 >= 0")
+    if halflife is not None and halflife <= 0:
+        raise ValueError("halflife 必须为正数")
+    if not isinstance(min_periods, int) or min_periods <= 0:
+        raise ValueError("min_periods 必须为正整数")
 
     series = pd.Series(data)
-    smoothed = series.ewm(span=span, alpha=alpha, adjust=False).mean()
+
+    ewm_kwargs = {
+        "adjust": adjust,
+        "min_periods": min_periods,
+    }
+    if span is not None:
+        ewm_kwargs["span"] = span
+    if alpha is not None:
+        ewm_kwargs["alpha"] = alpha
+    if com is not None:
+        ewm_kwargs["com"] = com
+    if halflife is not None:
+        ewm_kwargs["halflife"] = halflife
+
+    smoothed = series.ewm(**ewm_kwargs).mean()
+
+    if bias_correction and not adjust:
+        if alpha is None:
+            if span is not None:
+                alpha = 2 / (span + 1)
+            elif com is not None:
+                alpha = 1 / (com + 1)
+            elif halflife is not None:
+                alpha = 1 - np.exp(-np.log(2) / halflife)
+        n = np.arange(1, len(series) + 1)
+        bias = 1 - (1 - alpha) ** n
+        smoothed = smoothed / bias
 
     return smoothed
+
+
+def ewma_smooth(data, **kwargs):
+    """
+    指数加权移动平均（EWMA），为 exponential_moving_average_smooth 的别名函数。
+
+    Parameters
+    ----------
+    data : array-like
+        输入的时间序列数据
+    **kwargs
+        传递给 exponential_moving_average_smooth 的其他参数
+
+    Returns
+    -------
+    pd.Series
+        平滑后的时间序列
+    """
+    return exponential_moving_average_smooth(data, **kwargs)
+
+
+def smooth(data, method="simple", **kwargs):
+    """
+    统一平滑服务入口，支持多种平滑方法
+
+    Parameters
+    ----------
+    data : array-like
+        输入的时间序列数据
+    method : str, optional
+        平滑方法，可选值：
+        - "simple" / "ma" / "sma": 简单移动平均
+        - "weighted" / "wma": 加权移动平均
+        - "exponential" / "ema" / "ewma": 指数加权移动平均
+        默认为 "simple"
+    **kwargs
+        传递给对应平滑函数的参数，如 window_size, span, alpha 等
+
+    Returns
+    -------
+    pd.Series
+        平滑后的时间序列
+
+    Raises
+    ------
+    ValueError
+        如果 method 不是有效值
+    """
+    method_lower = method.lower()
+
+    if method_lower in ("simple", "ma", "sma"):
+        return moving_average_smooth(data, **kwargs)
+    elif method_lower in ("weighted", "wma"):
+        return weighted_moving_average_smooth(data, **kwargs)
+    elif method_lower in ("exponential", "ema", "ewma"):
+        return exponential_moving_average_smooth(data, **kwargs)
+    else:
+        raise ValueError(
+            f"不支持的平滑方法: {method}。可选方法: simple/ma/sma, weighted/wma, exponential/ema/ewma"
+        )
 
 
 if __name__ == "__main__":
@@ -150,10 +274,55 @@ if __name__ == "__main__":
     print("预期最后一个值：", round(expected, 4))
     print()
 
-    ema = exponential_moving_average_smooth(data, span=5)
-    print("指数移动平均（span=5，前5个）：", ema[:5].round(4).tolist())
+    print("=" * 60)
+    print("EWMA / 指数加权移动平均 功能测试")
+    print("-" * 60)
 
+    ema_span = exponential_moving_average_smooth(data, span=5)
+    print("EWMA (span=5，前5个)：", ema_span[:5].round(4).tolist())
+
+    ema_alpha = exponential_moving_average_smooth(data, alpha=0.3)
+    print("EWMA (alpha=0.3，前5个)：", ema_alpha[:5].round(4).tolist())
+
+    ema_com = exponential_moving_average_smooth(data, com=2)
+    print("EWMA (com=2，前5个)：", ema_com[:5].round(4).tolist())
+
+    ema_halflife = exponential_moving_average_smooth(data, halflife=3)
+    print("EWMA (halflife=3，前5个)：", ema_halflife[:5].round(4).tolist())
     print()
+
+    ewma_adj = ewma_smooth([1, 2, 3, 4, 5], alpha=0.5, adjust=True)
+    print("EWMA adjust=True (alpha=0.5, 数据=[1,2,3,4,5])：", ewma_adj.round(4).tolist())
+
+    ewma_bias = ewma_smooth([1, 2, 3, 4, 5], alpha=0.5, adjust=False, bias_correction=True)
+    print("EWMA with bias correction (alpha=0.5)：", ewma_bias.round(4).tolist())
+    print()
+
+    print("手动验证 alpha=0.5 bias correction:")
+    for i in range(1, 6):
+        raw = ewma_smooth([1,2,3,4,5], alpha=0.5, adjust=False)[i-1]
+        bias = 1 - (0.5)**i
+        corrected = raw / bias
+        print(f"  第{i}个: raw={raw:.4f}, bias={bias:.4f}, corrected={corrected:.4f}")
+    print()
+
+    print("=" * 60)
+    print("统一入口 smooth() 函数测试")
+    print("-" * 60)
+    test_data_simple = [1, 2, 3, 4, 5]
+    print("测试数据：", test_data_simple)
+    print()
+
+    r1 = smooth(test_data_simple, method="sma", window_size=3)
+    print("smooth method='sma', window_size=3:", r1.round(4).tolist())
+
+    r2 = smooth(test_data_simple, method="WMA", window_size=3, weights=[1,2,3])
+    print("smooth method='WMA', window_size=3:", r2.round(4).tolist())
+
+    r3 = smooth(test_data_simple, method="EWMA", alpha=0.5)
+    print("smooth method='EWMA', alpha=0.5:", r3.round(4).tolist())
+    print()
+
     print("=" * 60)
     print("边界处理验证：")
     print("-" * 60)
